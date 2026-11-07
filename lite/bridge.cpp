@@ -24,6 +24,8 @@ char* amUsername = nullptr;
 char* amPassword = nullptr;
 char* device_infos[9];
 char g_base_dir[256] = "data";
+static char g_dns_servers[512] = "";
+static char g_ca_bundle[512] = "/system/etc/security/cacert.pem";
 int offlineFlag = 0;
 uint8_t leaseMgr[256];
 #ifdef LITE_RELEASE
@@ -31,6 +33,7 @@ bool g_ssl_verify_disabled = false;
 #else
 bool g_ssl_verify_disabled = true;
 #endif
+int g_tls_mode = TLS_MODE_AUTO;
 bool g_code_from_file = false;
 
 extern const char* const fairplayCert;
@@ -55,6 +58,76 @@ static void split_string_safe(const char* input, const char* delim, char** out, 
     }
 }
 
+void set_dns_servers(const char* list) {
+    snprintf(g_dns_servers, sizeof(g_dns_servers), "%s", (list && *list) ? list : "");
+}
+
+void set_ca_bundle(const char* path) {
+    snprintf(g_ca_bundle, sizeof(g_ca_bundle), "%s",
+             (path && *path) ? path : "/system/etc/security/cacert.pem");
+}
+
+const char* get_ca_bundle() {
+    return g_ca_bundle;
+}
+
+/* Nameserver selection: an explicit list (--dns / LITE_DNS) wins, then the
+ * host's /etc/resolv.conf, then the built-in default kept for environments
+ * that ship no resolv.conf at all (the Android rootfs, old guest images). */
+static void split_nameservers(const std::string& s, std::vector<std::string>& out) {
+    std::string cur;
+    for (size_t i = 0; i <= s.size(); ++i) {
+        const char c = (i < s.size()) ? s[i] : ',';
+        if (c == ',' || c == ' ' || c == '\t' || c == ';' || c == '\n' || c == '\r') {
+            if (!cur.empty()) { out.push_back(cur); cur.clear(); }
+        } else {
+            cur += c;
+        }
+    }
+}
+
+static void read_resolv_conf(std::vector<std::string>& out) {
+    FILE* f = fopen("/etc/resolv.conf", "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (strncmp(p, "nameserver", 10) != 0) continue;
+        p += 10;
+        while (*p == ' ' || *p == '\t') ++p;
+        char* e = p;
+        while (*e && *e != '\n' && *e != '\r' && *e != ' ' && *e != '\t' && *e != '#') ++e;
+        if (e > p) out.push_back(std::string(p, e - p));
+    }
+    fclose(f);
+}
+
+static void apply_nameservers() {
+    std::vector<std::string> servers;
+    const char* source = "argument";
+    if (g_dns_servers[0]) split_nameservers(g_dns_servers, servers);
+    if (servers.empty()) {
+        read_resolv_conf(servers);
+        source = "/etc/resolv.conf";
+    }
+    if (servers.empty()) {
+        servers.push_back("8.8.8.8");
+        servers.push_back("8.8.4.4");
+        source = "built-in default";
+    }
+    if (servers.size() > 8) servers.resize(8);
+    std::vector<const char*> ptrs;
+    for (size_t i = 0; i < servers.size(); ++i) ptrs.push_back(servers[i].c_str());
+    _resolv_set_nameservers_for_net(0, &ptrs[0], (int)ptrs.size(), ".");
+    std::string joined;
+    for (size_t i = 0; i < servers.size(); ++i) {
+        if (i) joined += ",";
+        joined += servers[i];
+    }
+    LOG_INFO("DNS resolvers: %s (from %s)", joined.c_str(), source);
+}
+
 void init(const char* device_info_str) {
     LOG_INFO("initializing...");
     static char* prev_copy = nullptr;
@@ -66,8 +139,7 @@ void init(const char* device_info_str) {
     setenv("ANDROID_DNS_MODE", "local", 1);
     setenv("ANDROID_DATA", "/data", 1);
     setenv("ANDROID_ROOT", "/system", 1);
-    static const char* resolvers[2] = {"223.5.5.5", "223.6.6.6"};
-    _resolv_set_nameservers_for_net(0, resolvers, 2, ".");
+    apply_nameservers();
 
     union std_string conf1 = new_std_string(device_infos[8] ? device_infos[8] : "");
     union std_string conf2 = new_std_string("");
@@ -141,6 +213,7 @@ static int (*orig_debug_log_enabled)(void);
 static int (*orig_log_print)(int prio, const char *tag, const char *fmt, ...);
 static int (*orig_log_write)(int prio, const char *tag, const char *text);
 static int (*orig_curl_easy_setopt)(void *curl, int32_t option, ...);
+static int (*orig_curl_easy_perform)(void *curl);
 
 static uint8_t allDebug() { return 1; }
 
@@ -166,12 +239,35 @@ int curl_easy_setopt_hook(void *curl, int32_t option, ...) {
     va_start(args, option);
     void* param = va_arg(args, void*);
     va_end(args);
+    /* Some networks reset the default TLS handshake while TLS 1.3 passes,
+       so pin every transfer started by the Apple libraries to 1.3 as well
+       (CURLOPT_URL marks a new transfer; an explicit SSLVERSION is
+       overridden).  --tls default leaves the version untouched. */
+    if (g_tls_mode != TLS_MODE_DEFAULT) {
+        if (option == 10002) {
+            orig_curl_easy_setopt(curl, 32, CURL_SSLVERSION_TLSv1_3);
+        } else if (option == 32) {
+            return orig_curl_easy_setopt(curl, 32, CURL_SSLVERSION_TLSv1_3);
+        }
+    }
     if (g_ssl_verify_disabled && (option == 64 || option == 81 || option == 10230)) {
         LOG_DEBUG("hooked curl_easy_setopt %d (SSL verify disabled)", option);
         orig_curl_easy_setopt(curl, 43, 1L);
         return orig_curl_easy_setopt(curl, option, 0L);
     }
     return orig_curl_easy_setopt(curl, option, param);
+}
+
+/* TLS 1.3 is requested first; when the handshake is reset, retry the same
+ * transfer once with the library default.  The failure happens before any
+ * request bytes are written, so repeating it is safe. */
+int curl_easy_perform_hook(void *curl) {
+    int rc = orig_curl_easy_perform(curl);
+    if (rc != CURL_SSL_CONNECT_ERROR || g_tls_mode != TLS_MODE_AUTO) return rc;
+    orig_curl_easy_setopt(curl, 32, CURL_SSLVERSION_DEFAULT);
+    rc = orig_curl_easy_perform(curl);
+    if (rc == 0) LOG_DEBUG("tls: retried the transfer with the default handshake");
+    return rc;
 }
 
 void install_hooks() {
@@ -182,9 +278,8 @@ void install_hooks() {
               (void*)&allDebug, (void**)&orig_debug_log_enabled);
     DobbyHook((void*)&__android_log_print, (void*)&log_print_hook, (void**)&orig_log_print);
     DobbyHook((void*)&__android_log_write, (void*)&log_write_hook, (void**)&orig_log_write);
-    if (g_ssl_verify_disabled) {
-        DobbyHook((void*)&curl_easy_setopt, (void*)&curl_easy_setopt_hook, (void**)&orig_curl_easy_setopt);
-    }
+    DobbyHook((void*)&curl_easy_setopt, (void*)&curl_easy_setopt_hook, (void**)&orig_curl_easy_setopt);
+    DobbyHook((void*)&curl_easy_perform, (void*)&curl_easy_perform_hook, (void**)&orig_curl_easy_perform);
     LOG_DEBUG("debug hooks installed");
 }
 

@@ -63,6 +63,15 @@ bool CurlEasy::setOptStr(int opt, const char* str) {
     return setopt && setopt(handle, opt, str) == 0;
 }
 
+bool CurlEasy::setOptLong(int opt, long val) {
+    if (!handle) return false;
+    void* lib = getCurl();
+    if (!lib) return false;
+    typedef int (*curl_easy_setopt_t)(void*, int, long);
+    curl_easy_setopt_t setopt = (curl_easy_setopt_t)dlsym(lib, "curl_easy_setopt");
+    return setopt && setopt(handle, opt, val) == 0;
+}
+
 bool CurlEasy::setOptPtr(int opt, void* ptr) {
     if (!handle) return false;
     void* lib = getCurl();
@@ -117,6 +126,33 @@ static size_t writeCallback(char* data, size_t size, size_t nmemb, void* userp) 
     auto* str = (std::string*)userp;
     str->append(data, total);
     return total;
+}
+
+/* TLS verification is on unless --debug (or a Debug build) turned it off.
+ * The Android rootfs ships no CA store, so curl is pointed at the bundled
+ * Mozilla bundle (rootfs/system/etc/security/cacert.pem, installed as
+ * /system/etc/security/cacert.pem). Override it with --ca-bundle. */
+static void apply_tls(CurlEasy& curl) {
+    if (g_ssl_verify_disabled) {
+        curl.setOptInt(CURLOPT_SSL_VERIFYPEER, 0);
+        curl.setOptInt(CURLOPT_SSL_VERIFYHOST, 0);
+        return;
+    }
+    curl.setOptInt(CURLOPT_SSL_VERIFYPEER, 1);
+    curl.setOptInt(CURLOPT_SSL_VERIFYHOST, 2);
+    const char* bundle = get_ca_bundle();
+    if (bundle && *bundle) curl.setOptStr(CURLOPT_CAINFO, bundle);
+}
+
+/* TLS 1.3 first: some networks reset the default handshake for hosts such
+ * as music.apple.com while 1.3 passes.  The curl_easy_perform hook retries
+ * the transfer with the default handshake when 1.3 is refused; --tls selects
+ * the mode (auto / 1.3 / default). */
+static bool performRequest(CurlEasy& curl) {
+    if (g_tls_mode != TLS_MODE_DEFAULT) {
+        curl.setOptLong(CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_3);
+    }
+    return curl.perform();
 }
 
 /* ---- Token management (base_dir-aware, atomic writes) ---- */
@@ -184,13 +220,12 @@ std::string AppleApi::getDevToken() {
     curl.setOptStr(CURLOPT_URL, "https://music.apple.com");
     curl.setOptPtr(CURLOPT_WRITEFUNCTION, (void*)&writeCallback);
     curl.setOptPtr(CURLOPT_WRITEDATA, &html);
-    curl.setOptInt(CURLOPT_SSL_VERIFYPEER, 0);
-    curl.setOptInt(CURLOPT_SSL_VERIFYHOST, 0);
+    apply_tls(curl);
     curl.setOptInt(CURLOPT_FOLLOWLOCATION, 1);
     curl.setOptInt(CURLOPT_TIMEOUT_MS, 15000);
     curl.setOptStr(CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
     curl.setOptStr(CURLOPT_ACCEPT_ENCODING, "");
-    if (!curl.perform()) { LOG_WARN("devtoken: fetch music.apple.com failed"); return ""; }
+    if (!performRequest(curl)) { LOG_WARN("devtoken: fetch music.apple.com failed"); return ""; }
     LOG_DEBUG("devtoken: html size=%zu", html.size());
 
     std::regex jsRe("/assets/index~[^/]+\\.js");
@@ -205,12 +240,11 @@ std::string AppleApi::getDevToken() {
     jsCurl.setOptStr(CURLOPT_URL, ("https://music.apple.com" + jsPath).c_str());
     jsCurl.setOptPtr(CURLOPT_WRITEFUNCTION, (void*)&writeCallback);
     jsCurl.setOptPtr(CURLOPT_WRITEDATA, &js);
-    jsCurl.setOptInt(CURLOPT_SSL_VERIFYPEER, 0);
-    jsCurl.setOptInt(CURLOPT_SSL_VERIFYHOST, 0);
+    apply_tls(jsCurl);
     jsCurl.setOptInt(CURLOPT_FOLLOWLOCATION, 1);
     jsCurl.setOptInt(CURLOPT_TIMEOUT_MS, 15000);
     jsCurl.setOptStr(CURLOPT_ACCEPT_ENCODING, "");
-    if (!jsCurl.perform()) { LOG_WARN("devtoken: fetch js failed"); return ""; }
+    if (!performRequest(jsCurl)) { LOG_WARN("devtoken: fetch js failed"); return ""; }
     LOG_DEBUG("devtoken: js size=%zu", js.size());
 
     std::regex tokenRe("eyJ[A-Za-z0-9-_=]+\\.[A-Za-z0-9-_=]+\\.[A-Za-z0-9-_=]+");
@@ -306,8 +340,7 @@ std::string AppleApi::getLyrics(const std::string& adamId,
     curl.setOptStr(CURLOPT_URL, url.c_str());
     curl.setOptPtr(CURLOPT_WRITEFUNCTION, (void*)&writeCallback);
     curl.setOptPtr(CURLOPT_WRITEDATA, &resp);
-    curl.setOptInt(CURLOPT_SSL_VERIFYPEER, 0);
-    curl.setOptInt(CURLOPT_SSL_VERIFYHOST, 0);
+    apply_tls(curl);
     curl.setOptInt(CURLOPT_TIMEOUT_MS, 15000);
     curl.setOptStr(CURLOPT_USERAGENT, "Music/5.7 Android/10 model/Pixel6GR1YH build/1234 (dt:66)");
 
@@ -317,7 +350,7 @@ std::string AppleApi::getLyrics(const std::string& adamId,
     headers.append("Origin: https://music.apple.com");
     curl.setOptPtr(CURLOPT_HTTPHEADER, headers.list);
 
-    if (!curl.perform()) { LOG_WARN("lyrics curl perform failed"); return ""; }
+    if (!performRequest(curl)) { LOG_WARN("lyrics curl perform failed"); return ""; }
     long lstatus = curl.getResponseCode();
     if (lstatus != 200 && lstatus != 0) {
         LOG_WARN("lyrics http status=%ld body=%.300s", lstatus, resp.c_str());
@@ -375,8 +408,7 @@ std::string AppleApi::getWebPlayback(const std::string& adamId,
     curl.setOptStr(CURLOPT_URL, "https://play.music.apple.com/WebObjects/MZPlay.woa/wa/webPlayback");
     curl.setOptPtr(CURLOPT_WRITEFUNCTION, (void*)&writeCallback);
     curl.setOptPtr(CURLOPT_WRITEDATA, &resp);
-    curl.setOptInt(CURLOPT_SSL_VERIFYPEER, 0);
-    curl.setOptInt(CURLOPT_SSL_VERIFYHOST, 0);
+    apply_tls(curl);
     curl.setOptInt(CURLOPT_TIMEOUT_MS, 15000);
     curl.setOptStr(CURLOPT_POSTFIELDS, postBody.c_str());
     curl.setOptInt(CURLOPT_POST, 1);
@@ -392,7 +424,7 @@ std::string AppleApi::getWebPlayback(const std::string& adamId,
     headers.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36");
     curl.setOptPtr(CURLOPT_HTTPHEADER, headers.list);
 
-    if (!curl.perform()) { LOG_WARN("webplayback curl perform failed"); return ""; }
+    if (!performRequest(curl)) { LOG_WARN("webplayback curl perform failed"); return ""; }
     long wstatus = curl.getResponseCode();
     if (wstatus != 200 && wstatus != 0) {
         LOG_WARN("webplayback http status=%ld body=%.300s", wstatus, resp.c_str());
@@ -563,8 +595,7 @@ bool AppleApi::getLicense(const std::string& adamId,
     curl.setOptStr(CURLOPT_URL, "https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/acquireWebPlaybackLicense");
     curl.setOptPtr(CURLOPT_WRITEFUNCTION, (void*)&writeCallback);
     curl.setOptPtr(CURLOPT_WRITEDATA, &resp);
-    curl.setOptInt(CURLOPT_SSL_VERIFYPEER, 0);
-    curl.setOptInt(CURLOPT_SSL_VERIFYHOST, 0);
+    apply_tls(curl);
     curl.setOptInt(CURLOPT_TIMEOUT_MS, 15000);
     curl.setOptStr(CURLOPT_POSTFIELDS, postBody.c_str());
     curl.setOptInt(CURLOPT_POST, 1);
@@ -576,13 +607,12 @@ bool AppleApi::getLicense(const std::string& adamId,
     headers.append("Content-Type: application/json");
     curl.setOptPtr(CURLOPT_HTTPHEADER, headers.list);
 
-    if (!curl.perform()) { LOG_WARN("license curl perform failed"); return false; }
+    if (!performRequest(curl)) { LOG_WARN("license curl perform failed"); return false; }
     long lcode = curl.getResponseCode();
     LOG_DEBUG("license: dev=%.24s... music=%.24s... uri=%.60s",
               devToken.c_str(), musicToken.c_str(), uri.c_str());
-    /* The dlopen'd libcurl reports 0 instead of 200 here (same as lyrics and
-       webplayback, which both tolerate 0); a strict `!= 200` check wrongly
-       rejects a successful license. */
+    /* A 0 means curl_easy_getinfo could not report the status at all; treat
+       it as unknown rather than as a failure. */
     if (lcode != 200 && lcode != 0) {
         LOG_WARN("license http status=%ld body=%.300s", lcode, resp.c_str());
         return false;

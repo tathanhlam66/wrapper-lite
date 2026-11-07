@@ -41,6 +41,7 @@ struct CurlEasy {
     bool setOptInt(int opt, int val);
     bool setOptPtr(int opt, void* ptr);
     bool setOptStr(int opt, const char* str);
+    bool setOptLong(int opt, long val);
     bool perform();
     long getResponseCode();
 };
@@ -59,7 +60,19 @@ constexpr int CURLOPT_SSL_VERIFYPEER = 64;
 constexpr int CURLOPT_SSL_VERIFYHOST = 81;
 constexpr int CURLOPT_FOLLOWLOCATION = 52;
 constexpr int CURLOPT_ACCEPT_ENCODING = 10102;
-constexpr int CURLINFO_RESPONSE_CODE = 0x2000002;
+constexpr int CURLOPT_CAINFO      = 10065;
+constexpr int CURLOPT_SSLVERSION = 32;
+constexpr int CURL_SSL_CONNECT_ERROR = 35;
+
+/* TLS handling for the dlopen'd libcurl: prefer 1.3 and fall back to the
+   library default, force 1.3 only, or leave the version alone. */
+extern int g_tls_mode;
+constexpr int TLS_MODE_AUTO    = 0;
+constexpr int TLS_MODE_13      = 1;
+constexpr int TLS_MODE_DEFAULT = 2;
+constexpr long CURL_SSLVERSION_DEFAULT = 0;
+constexpr long CURL_SSLVERSION_TLSv1_3 = 7;
+constexpr int CURLINFO_RESPONSE_CODE = 0x200002;
 
 struct CurlSlist {
     void* list;
@@ -114,6 +127,11 @@ bool login(struct shared_ptr ctx);
 void set_device_info(const char* device_info);
 void set_base_dir(const char* dir);
 void set_credentials(const char* user, const char* pass);
+/* Resolver list for the Android layer: "ip[,ip...]" (--dns / LITE_DNS). */
+void set_dns_servers(const char* list);
+/* CA bundle used when TLS verification is enabled. */
+void set_ca_bundle(const char* path);
+const char* get_ca_bundle();
 /* Align original wrapper: offline accounts use download path, online use play path. */
 std::string get_m3u8(const std::string& adamId);
 std::string get_key(const std::string& adamId, const std::string& uri,
